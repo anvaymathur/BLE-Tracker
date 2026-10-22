@@ -1,3 +1,4 @@
+
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -7,14 +8,15 @@
 #include <vector>
 
 // --- Configuration ---
-const String wifiSSID = "YOUR_SSID";
-const String wifiPASS = "YOUR_PASSWORD";
-const String firebaseProjectID = "YOUR-PROJECT-ID"; // Replace with your Firebase Project ID
-const String gatewayID = "Aisle_1";                 // Identifier for this specific ESP32
+const char* wifiSSID = "YOUR_SSID";
+const char* wifiPASS = "YOUR_PASSWORD";
 
-int scanTime = 5; // Scan duration in seconds
-BLEScan* pBLEScan;
-int numDevices = 0;
+const String firebaseProjectID = "ble-tracker-62831";
+const String gatewayID = "A01";
+
+const int scanTime = 5;
+
+BLEScan* pBLEScan = nullptr;
 
 // --- Data Structures ---
 struct TelemetryItem {
@@ -23,80 +25,126 @@ struct TelemetryItem {
     unsigned long last_seen;
 };
 
-// Global buffer to collect tags during a scan window
 std::vector<TelemetryItem> itemBuffer;
 
-// Register target tag MAC addresses (Lowercase)
+// Registered tag MAC addresses, stored in uppercase.
 const String targetTags[] = {
-  "ac:23:3f:89:12:01",
-  "fe:ed:bb:11:22:33"
+    "AC:23:3F:89:12:01",
+    "FE:ED:BB:11:22:33"
 };
+
 const int numTargetTags = sizeof(targetTags) / sizeof(targetTags[0]);
 
 // --- Helper Functions ---
+
 bool isRegisteredTag(String macAddress) {
-    macAddress.toLowerCase();
+    macAddress.toUpperCase();
+
     for (int i = 0; i < numTargetTags; i++) {
-        if (macAddress == targetTags[i]) return true;
+        if (macAddress == targetTags[i]) {return true;}
     }
+
     return false;
 }
 
-void makePatchRequest(String url, String payload) {
-    
-    WiFiClientSecure client;
-    client.setInsecure(); // Bypass strict SSL certificate validation for testing
+// Keep only the latest reading for each MAC address.
+void updateBuffer(String macAddress, int rssi,
+                  unsigned long lastSeen) {
+    for (auto& item : itemBuffer) {
+        if (item.macAddress == macAddress) {
+            item.rssi = rssi;
+            item.last_seen = lastSeen;
+            return;
+        }
+    }
 
-    
+    itemBuffer.push_back({macAddress, rssi, lastSeen});
+}
+
+void makePatchRequest(const String& url,
+                      const String& payload) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Wi-Fi disconnected. Skipping request.");
+        return;
+    }
+
+    WiFiClientSecure client;
+
+    // Testing only: disables TLS certificate verification.
+    client.setInsecure();
 
     HTTPClient http;
+    http.setTimeout(10000);
 
-    if (http.begin(client, url)) {
-        http.addHeader("Content-Type", "application/json");
-        int statusCode = http.sendRequest("PATCH", payload);
-        
-        Serial.print("HTTP Response Code: ");
-        Serial.println(statusCode); // 200 indicates success OK
-        
-        http.end(); // Release network resources
+    if (!http.begin(client, url)) {
+        Serial.println("Failed to initialize HTTP connection.");
+        return;
     }
+
+    http.addHeader("Content-Type", "application/json");
+
+    int statusCode = http.sendRequest("PATCH", payload);
+
+    Serial.print("HTTP Response Code: ");
+    Serial.println(statusCode);
+
+    if (statusCode > 0) {
+        Serial.print("Firebase response: ");
+        Serial.println(http.getString());
+    } else {
+        Serial.print("HTTP error: ");
+        Serial.println(http.errorToString(statusCode));
+    }
+
+    http.end();
 }
 
 void processAndFlushBuffer() {
     for (const auto& item : itemBuffer) {
-        // Construct database endpoint targeting the specific tag ID node
-        String url = "https://" + firebaseProjectID + "-default-rtdb.firebaseio.com/active_tags/" + item.macAddress + ".json";
-        
-        // Build the JSON string payload
-        String payload = "{\"gateway_id\":\"" + gatewayID + "\",\"rssi\":" + String(item.rssi) + ",\"last_seen\":" + String(item.last_seen) + "}";
+        // Database path: /A01/<MAC address>
+        String url =
+            "https://" + firebaseProjectID +
+            "-default-rtdb.firebaseio.com/" +
+            gatewayID + "/" + item.macAddress + ".json";
+
+        // Match your existing database structure.
+        String payload =
+            "{\"rssi\":" + String(item.rssi) +
+            ",\"last_seen\":" + String(item.last_seen) + "}";
+
+        Serial.print("Writing tag ");
+        Serial.println(item.macAddress);
 
         makePatchRequest(url, payload);
     }
-    // Clear stored tags so the next scan starts fresh
+
     itemBuffer.clear();
 }
 
 // --- BLE Callbacks ---
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
-        // Retrieve the device's MAC Address
-        String deviceAddress = advertisedDevice.getAddress().toString().c_str();
+class MyAdvertisedDeviceCallbacks
+    : public BLEAdvertisedDeviceCallbacks {
+
+    void onResult(BLEAdvertisedDevice advertisedDevice) override {
+        String deviceAddress =
+            advertisedDevice.getAddress().toString().c_str();
+
+        deviceAddress.toUpperCase();
+
         int deviceRSSI = advertisedDevice.getRSSI();
 
-        // Filter out unwanted BLE signals
-        if (isRegisteredTag(deviceAddress) && deviceRSSI > -85) {
-            String deviceName = advertisedDevice.haveName() ? advertisedDevice.getName().c_str() : "[No Name]";
+        if (isRegisteredTag(deviceAddress) &&
+            deviceRSSI > -85) {
 
-            Serial.print("Target Tag Found! -> Name: ");
-            Serial.print(deviceName);
-            Serial.print(" | MAC: ");
+            Serial.print("Target tag found: ");
             Serial.print(deviceAddress);
             Serial.print(" | RSSI: ");
             Serial.println(deviceRSSI);
 
-            // Store in buffer to send via Wi-Fi outside the callback
+            // Time since ESP32 startup; not Unix time.
             unsigned long now = millis();
-            itemBuffer.push_back({deviceAddress, deviceRSSI, now});
+
+            updateBuffer(deviceAddress, deviceRSSI, now);
         }
     }
 };
@@ -104,49 +152,68 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 // --- Main Program ---
 void setup() {
     Serial.begin(115200);
-    Serial.println("Initializing ESP32 General BLE Scanner...");
 
-    // Connect to Wi-Fi
+    Serial.println("Initializing BLE tracker...");
+
+    // Connect to Wi-Fi.
     WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+    WiFi.begin(wifiSSID, wifiPASS);
+
+    Serial.print("Connecting to Wi-Fi");
 
     while (WiFi.status() != WL_CONNECTED) {
-        Serial.print(".");
         delay(500);
+        Serial.print(".");
     }
 
-    Serial.println("\nWi-Fi Connected!");
-    Serial.print("IP Address: ");
+    Serial.println("\nWi-Fi connected!");
+    Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
 
-    // Initialize BLE Scanner
+    // Initialize BLE scanner.
     BLEDevice::init("");
-    pBLEScan = BLEDevice::getScan(); 
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setActiveScan(true);  // Requests extra scan response data from tags
+
+    pBLEScan = BLEDevice::getScan();
+
+    pBLEScan->setAdvertisedDeviceCallbacks(
+        new MyAdvertisedDeviceCallbacks()
+    );
+
+    pBLEScan->setActiveScan(true);
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(99);
 }
 
 void loop() {
-    Serial.println("--- Starting New Scan Window ---");
+    Serial.println("\n--- Starting new scan window ---");
 
     if (WiFi.status() != WL_CONNECTED) {
-      WiFi.reconnect();
+        Serial.println("Reconnecting to Wi-Fi...");
+        WiFi.reconnect();
+
+        unsigned long startAttempt = millis();
+
+        while (WiFi.status() != WL_CONNECTED &&
+               millis() - startAttempt < 10000) {
+            delay(250);
+        }
     }
-    
-    // Start scanning
-    BLEScanResults foundDevices = pBLEScan->start(scanTime, false);
-    
-    Serial.print("Total target devices found in this scan: ");
+
+    // Do not scan or send requests if Wi-Fi is still unavailable.
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Wi-Fi unavailable. Retrying shortly.");
+        delay(2000);
+        return;
+    }
+
+    pBLEScan->start(scanTime, false);
+
+    Serial.print("Unique target tags found: ");
     Serial.println(itemBuffer.size());
 
-    // Send HTTP POST/PATCH requests for all cached data points
     processAndFlushBuffer();
-    
-    // Delete results from buffer to free up ESP32 memory
+
     pBLEScan->clearResults();
-    
-    // Wait 2 seconds before looping the scan
+
     delay(2000);
 }
